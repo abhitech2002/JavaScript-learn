@@ -1,0 +1,192 @@
+const express = require('express');
+const bodyParser = require('body-parser');
+const fs = require('fs');
+const path = require('path');
+const puppeteer = require('puppeteer');
+const { Readable } = require('stream');
+
+const app = express();
+const port = 3000;
+
+app.use(bodyParser.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Function to load and populate the HTML template with data
+const loadHTMLTemplate = (templateName, data) => {
+    const templatePath = path.join(__dirname, `./${templateName}.html`);
+    let htmlContent = fs.readFileSync(templatePath, 'utf8');
+
+    // Replace simple placeholders
+    for (const [key, value] of Object.entries(data)) {
+        if (typeof value !== 'object') {
+            const placeholder = `{{${key}}}`;
+            htmlContent = htmlContent.replace(new RegExp(placeholder, 'g'), value);
+        }
+    }
+
+    // Specific handling for the Pay Slip template
+    if (templateName === 'index') {
+        // Handle 'earning' array replacements
+        if (data.earning && Array.isArray(data.earning)) {
+            let earningsHtml = '';
+            data.earning.forEach((item) => {
+                earningsHtml += `
+                  <div style="display: flex; justify-content: space-between;">
+                      <div style="width: 50%;">${item.name}</div>
+                      <div style="width: 30%;">₹ ${item.amount}</div>
+                      <div style="width: 20%;">₹ ${item.ytd}</div>
+                  </div>
+              `;
+            });
+            htmlContent = htmlContent.replace('{{earning}}', earningsHtml);
+        }
+
+        // Handle 'deductions' array replacements
+        if (data.deductions && Array.isArray(data.deductions)) {
+            let deductionsHtml = '';
+            data.deductions.forEach((item) => {
+                deductionsHtml += `
+                  <div style="display: flex; justify-content: space-between;">
+                      <div style="width: 50%;">${item.name}</div>
+                      <div style="width: 30%;">₹ ${item.amount}</div>
+                      <div style="width: 20%;">₹ ${item.ytd}</div>
+                  </div>
+              `;
+            });
+            htmlContent = htmlContent.replace('{{deductions}}', deductionsHtml);
+        }
+    }
+
+    // Specific handling for the Invoice template
+    if (templateName === 'invoice') {
+        // Replace placeholders specific to the invoice
+        htmlContent = htmlContent
+            .replace('{{companyName}}', data.companyName)
+            .replace('{{billTo}}', data.billTo)
+            .replace('{{billAddress}}', data.billAddress)
+            .replace('{{billContact}}', data.billContact)
+            .replace('{{email}}', data.email);
+
+        // Handle invoice items
+        if (data.invoiceItems && Array.isArray(data.invoiceItems)) {
+            let itemsHtml = '';
+            data.invoiceItems.forEach((item, index) => {
+                itemsHtml += `
+                    <tr>
+                        <td>${index + 1}</td>
+                        <td>${item.itemName}</td>
+                        <td>${item.hsnCode}</td>
+                        <td>${item.quantity}</td>
+                        <td>${item.unit}</td>
+                        <td>${item.rate}</td>
+                        <td>${item.sgst}</td>
+                        <td>${item.cgst}</td>
+                        <td>${item.igst}</td>
+                        <td>${item.amount}</td>
+                    </tr>
+                `;
+            });
+            htmlContent = htmlContent.replace('{{invoiceItems}}', itemsHtml);
+        }
+    }
+
+    return htmlContent;
+};
+
+app.get('/ping', (req, res) => {
+    res.status(200).json({ "success": true });
+});
+
+// POST route to create a PDF from Pay Slip HTML template
+app.post('/generate-pdf', async (req, res) => {
+    const data = req.body;
+    console.log("Request received for Pay Slip");
+    if (!data.employee_id) {
+        return res.status(400).send('Employee ID required');
+    }
+
+    const htmlContent = loadHTMLTemplate('index', data); // Use 'index' for Pay Slip
+    const pdfPath = path.join(__dirname, `pdfs/Pay_Slip_${data.employee_id}_${Date.now()}.pdf`);
+
+    try {
+        const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+        const page = await browser.newPage();
+        await page.setContent(htmlContent, { waitUntil: 'load' });
+
+        const pdfBuffer = await page.pdf({ format: 'A4' });
+        await browser.close();
+
+        // Create a readable stream from the buffer
+        const pdfStream = new Readable();
+        pdfStream.push(pdfBuffer);
+        pdfStream.push(null); // Signal end of the stream
+
+        // Set headers for the response
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename=Pay_Slip_${data.employee_id}.pdf`);
+
+        // Stream the PDF to the response
+        pdfStream.pipe(res);
+
+    } catch (error) {
+        console.error('Error generating PDF:', error);
+        fs.appendFile('error.log', `${new Date().toISOString()} - ${error.message}\n`, (err) => {
+            if (err) {
+                console.error('Error writing to error log:', err);
+            }
+        });
+        res.status(500).send('Error generating PDF');
+    }
+});
+
+// POST route to create a PDF from Invoice HTML template
+app.post('/pdf', async (req, res) => {
+    try {
+        // Extract data from request body
+        const data = req.body;
+
+        // Load and prepare HTML content for invoice
+        const htmlContent = loadHTMLTemplate('invoice', data); // Use 'invoice' for Invoice PDF
+
+        // Launch Puppeteer
+        const browser = await puppeteer.launch({
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        });
+
+        const page = await browser.newPage();
+
+        // Set the content of the page with the modified HTML
+        await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
+
+        // Generate PDF with custom options
+        const pdfBuffer = await page.pdf({
+            format: 'A4',
+            printBackground: true, // Ensures CSS backgrounds are included
+        });
+
+        await browser.close();
+
+        // Stream the PDF to the response
+        const pdfStream = new Readable();
+        pdfStream.push(pdfBuffer);
+        pdfStream.push(null);
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', 'attachment; filename="invoice.pdf"');
+
+        pdfStream.pipe(res);
+    } catch (error) {
+        console.error('Error generating PDF:', error);
+        res.status(500).send('Error generating PDF');
+    }
+});
+
+// Create the pdfs directory if it doesn't exist
+if (!fs.existsSync(path.join(__dirname, 'pdfs'))) {
+    fs.mkdirSync(path.join(__dirname, 'pdfs'));
+}
+
+app.listen(port, () => {
+    console.log(`Server is running on http://localhost:${port}`);
+});
